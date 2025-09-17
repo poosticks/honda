@@ -1,0 +1,35 @@
+# Honda pipeline configuration
+
+comfy_host: "127.0.0.1"
+comfy_port: 8188
+
+# ComfyUI workflow path (relative or absolute)
+workflow: "workflows/txt2img_sd1.5.json"
+
+# IMPORTANT: Must match exactly a checkpoint visible in ComfyUI (Models → Checkpoints list)
+# Examples you might have:
+#   "v1-5-pruned-emaonly.safetensors"
+#   "SD1.5/cyberrealistic_v90.safetensors"
+ckpt_name: "cyberrealistic_v90.safetensors"
+
+# Stable Diffusion sampling (per-image)
+sampler: "euler_a"
+scheduler: "normal"
+sd_steps: 30
+cfg_scale: 5.0
+
+# Batch design
+seeds: 30
+batch_size: 1
+
+# Runtime
+device: "cuda"         # or "cpu"
+use_dreamsim: false
+
+# Convergence loop defaults (CLI can override)
+iters: 3
+budget: null
+output_dir: "outputs"
+
+# Captioner
+blip_model: "Salesforce/blip-image-captioning-large"

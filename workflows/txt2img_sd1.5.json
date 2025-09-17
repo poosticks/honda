@@ -1,0 +1,66 @@
+{
+  "0": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "cyberrealistic_v90.safetensors"
+    },
+    "_meta": {"title": "Load SD1.5 Model"}
+  },
+  "1": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "###PROMPT###",
+      "clip": ["0", 1]
+    },
+    "_meta": {"title": "CLIP Text Encode (Positive)"}
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "###NEGATIVE_PROMPT###",
+      "clip": ["0", 1]
+    },
+    "_meta": {"title": "CLIP Text Encode (Negative)"}
+  },
+  "3": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 512,
+      "height": 512,
+      "batch_size": 1
+    },
+    "_meta": {"title": "Empty Latent Image"}
+  },
+  "4": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["0", 0],
+      "seed": 0,
+      "steps": 30,
+      "cfg": 5.0,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "positive": ["1", 0],
+      "negative": ["2", 0],
+      "latent_image": ["3", 0],
+      "denoise": 1.0
+    },
+    "_meta": {"title": "KSampler"}
+  },
+  "5": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["4", 0],
+      "vae": ["0", 2]
+    },
+    "_meta": {"title": "VAE Decode"}
+  },
+  "6": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["5", 0],
+      "filename_prefix": "comfy_output"
+    },
+    "_meta": {"title": "Save Image"}
+  }
+}

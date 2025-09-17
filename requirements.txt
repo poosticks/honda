@@ -1,0 +1,20 @@
+# Core
+torch>=2.6.0,<3.0
+torchvision>=0.23.0,<0.24.0
+
+# Models & metrics
+transformers>=4.40
+lpips==0.1.4
+openai-clip>=1.0.1
+Pillow>=9.5
+numpy>=1.26
+scipy>=1.12
+
+# ComfyUI client & CLI
+requests>=2.31
+requests-toolbelt>=1.0.0
+websocket-client>=1.6
+typer>=0.9.0
+click>=8.1
+PyYAML>=6.0
+accelerate>=0.20.3
