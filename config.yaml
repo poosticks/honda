@@ -33,3 +33,10 @@ output_dir: "outputs"
 
 # Captioner
 blip_model: "Salesforce/blip-image-captioning-large"
+
+#ComfyUI directories
+comfy_root: "C:/ComfyUI/ComfyUI"
+comfy_output_dir: "C:/ComfyUI/ComfyUI/output"
+# Optionally shrink the wait:
+history_timeout_s: 20
+disk_grace_s: 6

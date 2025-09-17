@@ -35,36 +35,22 @@ def list_images(paths: Iterable[str]) -> List[str]:
 # ---------- ComfyUI output pickup ----------
 
 def find_comfy_output_dir(cfg: Dict[str, Any]) -> Optional[Path]:
-    """Return the folder ComfyUI writes images to. Prefer the actual ComfyUI/output path."""
-    # 0) explicit override
+    # Respect explicit config if present
     out_override = cfg.get("comfy_output_dir")
     if out_override:
         p = Path(out_override)
         if p.exists():
             return p
 
-    # 1) if a comfy root is provided, prefer its output folder
-    comfy_root = cfg.get("comfy_root")
-    if comfy_root:
-        p = Path(comfy_root) / "output"
-        if p.exists():
-            return p
-
-    # 2) common ComfyUI Windows locations (highest priority)
+    # Common defaults
     candidates = [
-        Path("C:/ComfyUI/ComfyUI/output"),
-        Path.home() / "ComfyUI" / "ComfyUI" / "output",
-        Path.home() / "ComfyUI" / "output",
-    ]
-
-    # 3) fall back to local project folders last
-    candidates += [
         Path("output"),
         Path("outputs"),
         Path("..") / "output",
         Path("..") / "outputs",
+        Path("C:/ComfyUI/ComfyUI/output"),
+        Path.home() / "ComfyUI" / "output",
     ]
-
     for c in candidates:
         if c.exists():
             return c
@@ -73,7 +59,7 @@ def find_comfy_output_dir(cfg: Dict[str, Any]) -> Optional[Path]:
 
 def find_recent_outputs(output_dir: Path, filename_prefix: str, since_ts: float, limit: int = 1) -> List[Path]:
     files = []
-    if not output_dir or not output_dir.exists():
+    if not output_dir.exists():
         return files
     for p in output_dir.glob(f"{filename_prefix}*"):
         try:
@@ -96,12 +82,12 @@ def copy_into_outputs(src: Path, dst_dir: Path) -> Path:
 
 def _possible_comfy_roots(cfg: Dict[str, Any]) -> List[Path]:
     roots = []
-    # explicit root
+    # 1) explicit
     root_cfg = cfg.get("comfy_root")
     if root_cfg:
         roots.append(Path(root_cfg))
 
-    # current working dir and parents
+    # 2) working dir and parents
     cwd = Path.cwd()
     for p in [cwd] + list(cwd.parents):
         if (p / "models" / "checkpoints").exists():
@@ -109,13 +95,13 @@ def _possible_comfy_roots(cfg: Dict[str, Any]) -> List[Path]:
         if p.name.lower() == "comfyui" and (p / "output").exists():
             roots.append(p)
 
-    # typical Windows locations
+    # 3) common Windows locations
     roots += [
         Path("C:/ComfyUI/ComfyUI"),
         Path.home() / "ComfyUI" / "ComfyUI",
         Path.home() / "ComfyUI"
     ]
-    # dedup
+    # Dedup while preserving order
     seen, out = set(), []
     for r in roots:
         try:
@@ -129,7 +115,10 @@ def _possible_comfy_roots(cfg: Dict[str, Any]) -> List[Path]:
 
 
 def discover_checkpoints_on_disk(cfg: Dict[str, Any]) -> List[str]:
-    """Return names ComfyUI expects (subdir/name.safetensors) and the bare filename as fallback."""
+    """Return names the way ComfyUI usually displays them:
+       - subdir/name.safetensors  (forward slashes)
+       - also include bare filename as a fallback
+    """
     names = []
     for root in _possible_comfy_roots(cfg):
         ck_dir = root / "models" / "checkpoints"
@@ -137,8 +126,10 @@ def discover_checkpoints_on_disk(cfg: Dict[str, Any]) -> List[str]:
             continue
         for p in ck_dir.rglob("*"):
             if p.is_file() and p.suffix.lower() in (".safetensors", ".ckpt"):
+                # relative to checkpoints dir, forward slashes
                 rel = p.relative_to(ck_dir).as_posix()
                 names.append(rel)
+                # add bare filename too
                 names.append(p.name)
     # de-dup, keep order
     out, seen = [], set()
@@ -150,6 +141,7 @@ def discover_checkpoints_on_disk(cfg: Dict[str, Any]) -> List[str]:
 
 # ---------- Sampler/scheduler normalization ----------
 
+# Minimal mapping of common synonyms → Comfy sampler names
 _SAMPLER_MAP = {
     "euler_a": "euler_ancestral",
     "euler-ancestral": "euler_ancestral",
@@ -164,10 +156,13 @@ def normalize_sampler(requested: str, server_list: List[str]) -> str:
     req = _norm(requested)
     if not server_list:
         return _SAMPLER_MAP.get(req, requested)
+    # exact or case-insensitive exact
     for s in server_list:
         if s == requested or _norm(s) == req:
             return s
+    # mapped synonym
     mapped = _SAMPLER_MAP.get(req, requested)
+    # endswith heuristic
     cand = [s for s in server_list if _norm(s).endswith(_norm(mapped))]
     if len(cand) == 1:
         return cand[0]

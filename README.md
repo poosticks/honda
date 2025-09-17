@@ -9,11 +9,35 @@ Got it. Here’s a full **README.md** draft that covers objectives, CLI usage, f
 `honda` is a command-line interface (CLI) that coordinates prompts, workflows, and outputs between **ComfyUI** and a local image-captioning/generation stack.
 It enables:
 
-* Captioning reference images (via BLIP/CLIP).
-* Generating images using ComfyUI workflows (txt2img / img2img).
-* Managing reproducibility with configs, seeds, and workflow coordination.
+# Honda
 
-The CLI provides an auditable workflow: you supply prompts and parameters, Honda prepares a JSON workflow for ComfyUI, submits it, and collects results into structured outputs.
+Honda is a modular research framework for iteratively converging Stable Diffusion (via ComfyUI) generations toward a reference image. It is designed for reproducibility, determinism, and extensibility — integrating captioning, DOE-style prompt experiments, and similarity metrics.
+
+## Features
+- Local BLIP captioning of reference images
+- Prompt generation + management
+- Batch generation via ComfyUI API
+- Similarity scoring (LPIPS + CLIP/DINO)
+- DOE loop for prompt refinement
+- JSONL logging for reproducibility
+
+## Quick Start
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Caption an image
+honda caption ref.png
+
+# Generate images
+honda generate --prompt "a test photo" --seeds 30
+
+# Score candidates
+honda score --ref ref.png --candidates outputs/*.png
+
+# Full convergence loop
+honda converge --ref ref.png --steps 3 --budget 90
+
 
 ---
 
