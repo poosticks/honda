@@ -1,267 +1,242 @@
-from pathlib import Path
-from typing import Optional, List
-from copy import deepcopy
-import time
+# honda/cli.py
+from __future__ import annotations
 import json
+import pathlib
+import random
+import time
+from typing import Any, Dict, List, Tuple
+
 import typer
+from PIL import Image
+import yaml
 
-from . import utils
 from .comfy_client import ComfyClient
-from .caption_blip import ImageCaptioner
-from . import converge as converge_mod
-from . import metrics
+from .metrics import CompositeScorer
+from .prompter_openai import PromptVariantGenerator
+from .diff_qwen_openai import QwenVisualDiff
+from .caption_qwen_openai import ImageCaptionerQwenOpenAI
 
-app = typer.Typer(help="Honda: Convergent image generation pipeline")
+app = typer.Typer(add_completion=False)
 
-def _norm(x: Optional[str]) -> str:
-    return (x or "").strip().lower()
 
-def _resolve_ref(ref_arg: Optional[Path], ref_opt: Optional[Path]) -> Path:
-    path = ref_opt or ref_arg
-    if path is None:
-        raise typer.BadParameter("Provide the reference image as a positional argument or with --ref.")
-    if not path.exists():
-        raise typer.BadParameter(f"Reference image not found: {path}")
-    return path
+def _load_cfg(config: str | None) -> Dict[str, Any]:
+    p = pathlib.Path(config or "config.yaml")
+    with p.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-def _map_ckpt_name(cfg: dict, client: ComfyClient, requested: Optional[str]) -> str:
-    req = (requested or "").strip()
-    server = client.get_checkpoints()
-    disk = utils.discover_checkpoints_on_disk(cfg)
-    candidates = server + [x for x in disk if x not in server]
 
-    if not candidates:
-        return req
+def _build_txt2img_workflow(cfg: Dict[str, Any], prompt: str, negative: str, seed: int) -> Dict[str, Any]:
+    comfy = cfg["comfy"]
+    return {
+        "0": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": comfy["ckpt_name"]}},
+        "1": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["0", 1]}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["0", 1]}},
+        "3": {"class_type": "EmptyLatentImage", "inputs": {
+            "width": int(comfy["width"]), "height": int(comfy["height"]), "batch_size": int(comfy["batch_size"])
+        }},
+        "4": {"class_type": "KSampler", "inputs": {
+            "seed": int(seed),
+            "steps": int(comfy["sd_steps"]),
+            "cfg": float(comfy["cfg_scale"]),
+            "sampler_name": comfy["sampler"],
+            "scheduler": comfy["scheduler"],
+            "denoise": 1.0,
+            "model": ["0", 0],
+            "positive": ["1", 0],
+            "negative": ["2", 0],
+            "latent_image": ["3", 0]
+        }},
+        "5": {"class_type": "VAEDecode", "inputs": {"samples": ["4", 0], "vae": ["0", 2]}},
+        "6": {"class_type": "SaveImage", "inputs": {"filename_prefix": comfy["filename_prefix"], "images": ["5", 0]}},
+    }
 
-    if req in candidates:
-        return req
-    for s in candidates:
-        if _norm(s) == _norm(req):
-            if s != req:
-                typer.echo(json.dumps({"info": "ckpt_mapped", "requested": req, "selected": s}))
-            return s
-    ends = [s for s in candidates if _norm(s).endswith(_norm(req))]
-    if len(ends) == 1:
-        typer.echo(json.dumps({"info": "ckpt_mapped", "requested": req, "selected": ends[0]}))
-        return ends[0]
-    if len(ends) > 1:
-        typer.echo(json.dumps({"error": "ckpt_ambiguous", "requested": req, "candidates": ends}))
-        raise typer.Exit(2)
 
-    typer.echo(json.dumps({"error": "ckpt_not_found", "requested": req, "available": candidates}))
-    raise typer.Exit(2)
+def _select_best(scorer: CompositeScorer, ref_path: pathlib.Path, cand_paths: List[pathlib.Path]) -> Tuple[pathlib.Path, Dict[str, float]]:
+    ref_img = Image.open(ref_path).convert("RGB")
+    best_path = None
+    best_metrics = None
+    best_score = -1e9
+    for p in cand_paths:
+        try:
+            img = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+        m = scorer.score_pair(ref_img, img)
+        score = m.get("combined", 0.0)
+        if score > best_score:
+            best_score = score
+            best_path = p
+            best_metrics = m
+    return best_path, best_metrics or {"lpips": 1.0, "clip_cos": 0.0, "combined": 0.0}
 
-@app.command()
-def caption(
-    ref_arg: Optional[Path] = typer.Argument(None, help="Reference image path"),
-    ref: Optional[Path] = typer.Option(None, "--ref", "-r", help="Reference image path"),
-    config_path: Path = typer.Option("config.yaml", "--config", help="Path to config file"),
-):
-    cfg = utils.load_config(str(config_path))
-    image_path = _resolve_ref(ref_arg, ref)
-    device = cfg.get("device", "cuda")
-    model_name = cfg.get("blip_model", "Salesforce/blip-image-captioning-large")
-    captioner = ImageCaptioner(device=device, blip_model=model_name)
-    result = {"caption": captioner.caption(str(image_path))}
-    typer.echo(json.dumps(result))
 
 @app.command()
 def generate(
-    prompt: str = typer.Option(..., "--prompt", "-p", help="Positive prompt text"),
-    negative: str = typer.Option("", "--negative", "-n", help="Negative prompt text"),
-    seeds: int = typer.Option(1, "--seeds", "-s", help="Number of seeds (images) to generate"),
-    output: Path = typer.Option(Path("outputs"), "--output", "-o", help="Output directory to save images"),
-    config_path: Path = typer.Option("config.yaml", "--config", help="Path to config file"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print resolved workflow and diagnostics"),
+    prompt: str = typer.Option(..., help="Positive prompt."),
+    seeds: int = typer.Option(3, help="How many seeds to try."),
+    config: str = typer.Option("config.yaml", help="Path to config YAML."),
+    verbose: bool = typer.Option(False, help="Extra JSON logging."),
 ):
-    cfg = utils.load_config(str(config_path))
-    cfg["output_dir"] = str(output)
+    cfg = _load_cfg(config)
+    comfy = cfg["comfy"]
+    paths = cfg["paths"]
 
-    client = ComfyClient(host=cfg.get("comfy_host", "127.0.0.1"), port=cfg.get("comfy_port", 8188))
+    client = ComfyClient(comfy["host"], int(comfy["port"]))
+    repo_outputs_dir = pathlib.Path(paths["outputs_dir"]).resolve()
+    repo_outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    requested_ckpt = cfg.get("ckpt_name") or ""
-    resolved_ckpt = _map_ckpt_name(cfg, client, requested_ckpt)
+    negative = cfg["prompter"]["default_negative"] if cfg["prompter"].get("inject_negative", True) else ""
 
-    server_samplers = client.get_samplers()
-    server_schedulers = client.get_schedulers()
-    requested_sampler = cfg.get("sampler", "euler_ancestral")
-    requested_scheduler = cfg.get("scheduler", "normal")
-    selected_sampler = utils.normalize_sampler(requested_sampler, server_samplers)
-    selected_scheduler = utils.normalize_scheduler(requested_scheduler, server_schedulers)
-    if _norm(requested_sampler) != _norm(selected_sampler):
-        typer.echo(json.dumps({"info": "sampler_mapped", "requested": requested_sampler, "selected": selected_sampler}))
-    if _norm(requested_scheduler) != _norm(selected_scheduler):
-        typer.echo(json.dumps({"info": "scheduler_mapped", "requested": requested_scheduler, "selected": selected_scheduler}))
+    results = []
+    for s in range(1, seeds + 1):
+        wf = _build_txt2img_workflow(cfg, prompt, negative, seed=s)
+        resp = client.queue_prompt(wf)
+        hist = client.await_prompt(resp["prompt_id"], poll_interval_s=cfg["io"]["poll_interval_s"],
+                                   timeout_s=cfg["io"]["history_timeout_s"])
 
-    wf_path = cfg.get("workflow")
-    if not wf_path or not Path(wf_path).exists():
-        typer.echo(json.dumps({"error": "workflow_not_found", "wf_path": wf_path}))
-        raise typer.Exit(1)
-
-    try:
-        base_workflow = json.loads(Path(wf_path).read_text(encoding="utf-8"))
-    except Exception as e:
-        typer.echo(json.dumps({"error": "invalid_workflow_json", "wf_path": wf_path, "details": str(e)}))
-        raise typer.Exit(2)
-
-    for key in ("0", "4", "6"):
-        if key not in base_workflow:
-            typer.echo(json.dumps({"error": "invalid_workflow_shape", "missing": key}))
-            raise typer.Exit(2)
-
-    # Apply config (keep your values)
-    base_workflow["0"]["inputs"]["ckpt_name"] = resolved_ckpt
-    base_workflow["4"]["inputs"]["sampler_name"] = selected_sampler
-    base_workflow["4"]["inputs"]["scheduler"] = selected_scheduler
-    base_workflow["4"]["inputs"]["steps"] = int(cfg.get("sd_steps", 30))
-    base_workflow["4"]["inputs"]["cfg"] = float(cfg.get("cfg_scale", 5.0))
-    base_workflow["3"]["inputs"]["batch_size"] = 1
+        saved = client.download_all_outputs(hist, repo_outputs_dir)
+        results.append({"seed": s, "prompt_id": resp.get("prompt_id"), "saved": [str(p) for p in saved]})
 
     if verbose:
-        digest = {
-            "nodes": len(base_workflow),
-            "ksampler": base_workflow["4"]["class_type"],
-            "saveimage": base_workflow["6"]["class_type"],
-            "ckpt_name": base_workflow["0"]["inputs"].get("ckpt_name"),
-            "sampler_name": base_workflow["4"]["inputs"].get("sampler_name"),
-            "scheduler": base_workflow["4"]["inputs"].get("scheduler"),
-            "steps": base_workflow["4"]["inputs"].get("steps"),
-            "cfg": base_workflow["4"]["inputs"].get("cfg"),
-        }
-        typer.echo(json.dumps({"debug": "resolved_workflow", "digest": digest}))
+        typer.echo(json.dumps({"debug": "resolved_workflow"}))
+    typer.echo(json.dumps({"ok": True, "results": results}))
 
-    comfy_out_dir = utils.find_comfy_output_dir(cfg)
-    filename_prefix = base_workflow.get("6", {}).get("inputs", {}).get("filename_prefix", "comfy_output")
-
-    # Short grace: check disk first (most reliable) for a few seconds
-    def _try_disk_pickup(start_ts: float) -> Optional[Path]:
-        if not comfy_out_dir:
-            return None
-        recent = utils.find_recent_outputs(comfy_out_dir, filename_prefix, since_ts=start_ts, limit=1)
-        return recent[0] if recent else None
-
-    history_timeout = int(cfg.get("history_timeout_s", 90))
-    short_grace_s = int(cfg.get("disk_grace_s", 6))  # new: quick disk-first window
-
-    for i in range(seeds):
-        seed_val = i + 1
-        wf = deepcopy(base_workflow)
-        wf["1"]["inputs"]["text"] = prompt
-        wf["2"]["inputs"]["text"] = negative
-        wf["4"]["inputs"]["seed"] = seed_val
-
-        start_ts = time.time()
-        pid = client.submit(wf)
-
-        # 1) Early disk pickup loop (don’t stall if the image is already on disk)
-        picked = None
-        end_early = start_ts + short_grace_s
-        while time.time() < end_early:
-            picked = _try_disk_pickup(start_ts)
-            if picked:
-                break
-            time.sleep(0.25)
-
-        images_emitted = 0
-        if picked:
-            utils.ensure_dir(str(output))
-            dst = utils.copy_into_outputs(picked, Path(output))
-            typer.echo(json.dumps({
-                "info": "disk_fallback_early",
-                "comfy_output": str(picked),
-                "output": str(dst),
-                "seed": seed_val,
-                "prompt": prompt,
-                "negative": negative
-            }))
-            images_emitted = 1
-        else:
-            # 2) Fall back to history; if empty, try disk again at the end
-            try:
-                history = client.wait_for_completion(pid, max_wait_s=history_timeout)
-            except TimeoutError:
-                history = None
-
-            if isinstance(history, dict):
-                outputs = history.get("outputs", {}) or {}
-                for _, outdata in outputs.items():
-                    for img_info in (outdata.get("images") or []):
-                        fname = img_info["filename"]; subf = img_info["subfolder"]; ftype = img_info["type"]
-                        img_bytes = client.get_image(fname, subfolder=subf, folder_type=ftype)
-                        utils.ensure_dir(str(output))
-                        out_path = Path(output) / fname
-                        out_path.write_bytes(img_bytes)
-                        typer.echo(json.dumps({"seed": seed_val, "prompt": prompt, "negative": negative, "output": str(out_path)}))
-                        images_emitted += 1
-
-            if images_emitted == 0:
-                picked = _try_disk_pickup(start_ts)
-                if picked:
-                    utils.ensure_dir(str(output))
-                    dst = utils.copy_into_outputs(picked, Path(output))
-                    typer.echo(json.dumps({
-                        "info": "disk_fallback",
-                        "reason": "history_missing_images",
-                        "comfy_output": str(picked),
-                        "output": str(dst),
-                        "seed": seed_val,
-                        "prompt": prompt,
-                        "negative": negative
-                    }))
-                    images_emitted = 1
-
-        if images_emitted == 0:
-            err = {
-                "error": "no_images_detected",
-                "details": {
-                    "prompt_id": pid,
-                    "history_timeout_s": history_timeout,
-                    "comfy_output_dir": str(comfy_out_dir) if comfy_out_dir else None,
-                    "filename_prefix": filename_prefix,
-                    "hint": {
-                        "ckpt_used": resolved_ckpt,
-                        "sampler": base_workflow["4"]["inputs"]["sampler_name"],
-                        "scheduler": base_workflow["4"]["inputs"]["scheduler"]
-                    }
-                }
-            }
-            typer.echo(json.dumps(err))
-            raise typer.Exit(2)
-
-@app.command()
-def score(
-    ref_arg: Optional[Path] = typer.Argument(None, help="Reference image path"),
-    ref: Optional[Path] = typer.Option(None, "--ref", "-r", help="Reference image path"),
-    candidates: List[Path] = typer.Argument(..., help="Generated image(s) to score (glob or paths)"),
-    use_dreamsim: bool = typer.Option(False, "--use-dreamsim", help="Use DreamSim metric if available"),
-    config_path: Path = typer.Option("config.yaml", "--config", help="Path to config file"),
-):
-    cfg = utils.load_config(str(config_path))
-    ref_path = _resolve_ref(ref_arg, ref)
-    files = utils.list_images([str(p) for p in candidates])
-    if not files:
-        typer.echo("No candidate images found for scoring.", err=True)
-        raise typer.Exit(1)
-    for img in files:
-        scores = metrics.compute_composite_score(img, str(ref_path), use_dream=use_dreamsim, device=cfg.get("device", "cuda"))
-        result = {"image": img, "lpips": scores["lpips"], "clip": scores["clip_sim"], "dreamsim": scores.get("dream_sim"), "score": scores["score"]}
-        typer.echo(json.dumps(result))
 
 @app.command()
 def converge(
-    ref_arg: Optional[Path] = typer.Argument(None, help="Reference image path"),
-    ref: Optional[Path] = typer.Option(None, "--ref", "-r", help="Reference image path"),
-    iters: int = typer.Option(3, "--steps", "-t", help="Max prompt refinement iterations (not SD steps)"),
-    budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Max total images to generate"),
-    config_path: Path = typer.Option("config.yaml", "--config", help="Path to config file"),
+    ref: pathlib.Path = typer.Option(..., exists=True, readable=True, help="Reference image path."),
+    steps: int = typer.Option(30, help="Comfy sampler steps (cfg.comfy.sd_steps will be overridden)."),
+    budget: int = typer.Option(30, help="Total images to render."),
+    device: str = typer.Option("cpu", help="Scoring device (cpu/cuda:0)."),
+    config: str = typer.Option("config.yaml", help="Path to config YAML."),
 ):
-    cfg = utils.load_config(str(config_path))
-    ref_path = _resolve_ref(ref_arg, ref)
-    cfg["iters"] = iters
-    if budget is not None:
-        cfg["budget"] = budget
-    for result in converge_mod.run_convergence(str(ref_path), cfg):
-        typer.echo(json.dumps(result))
+    cfg = _load_cfg(config)
+    # reflect CLI overrides
+    cfg["convergence"]["total_budget"] = int(budget)
+    cfg["convergence"]["device"] = device
+    cfg["comfy"]["sd_steps"] = int(steps)
 
-if __name__ == "__main__":
-    app(prog_name="honda")
+    # 1) caption with Qwen-VL (for init base prompt)
+    cap = ImageCaptionerQwenOpenAI(cfg)
+    caption_text = cap.caption(str(ref))
+    typer.echo(json.dumps({"stage": "init", "caption": caption_text, "source": "qwen_vl"}))
+
+    # 2) prompter and scorer and visual diff
+    prompter = PromptVariantGenerator(cfg["prompter"])
+    scorer = CompositeScorer(cfg["scoring"])
+    qdiff = QwenVisualDiff(cfg)
+
+    # 3) I/O
+    comfy = cfg["comfy"]
+    paths = cfg["paths"]
+    client = ComfyClient(comfy["host"], int(comfy["port"]))
+    repo_outputs_dir = pathlib.Path(paths["outputs_dir"]).resolve()
+    repo_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # optional: where Comfy writes (for fallback)
+    comfy_out_dir = pathlib.Path(paths.get("comfy_output_dir", "") or "").resolve() if paths.get("comfy_output_dir") else None
+
+    # loop params
+    conv = cfg["convergence"]
+    iterations = int(conv["iterations"])
+    seeds_per_round = int(conv["seeds_per_round"])
+    total_budget = int(conv["total_budget"])
+    remaining = total_budget
+
+    # negatives control
+    default_negative = cfg["prompter"]["default_negative"]
+    inject_negative = bool(cfg["prompter"].get("inject_negative", True))
+    negative = default_negative if inject_negative else ""
+
+    # carry forward settings
+    carry_n = int(cfg["prompter"].get("carry_forward_modifiers", 1))
+
+    best_overall = None  # dict with keys: path, prompt, metrics
+
+    round_i = 0
+    while remaining > 0 and round_i < iterations:
+        # If we already have a winner from a previous round, diff it vs reference and build feedback
+        if best_overall:
+            fb = qdiff.diff(str(ref), str(best_overall["path"]))
+        else:
+            fb = {"add": [], "remove": [], "style": [], "neg": [], "summary": ""}
+
+        # Update negatives for this round
+        if inject_negative:
+            extra_negs = sorted(set((fb.get("neg") or []) + (fb.get("remove") or [])))
+            negative = default_negative + (", " + ", ".join(extra_negs) if extra_negs else "")
+
+        # Ask LLM for feedback-aware variants
+        base_prompt = (best_overall or {}).get("prompt") or caption_text
+        variants = prompter.generate_variants(
+            base_prompt,
+            max_variants=int(cfg["prompter"]["max_variants"]),
+            feedback=fb if best_overall else None,
+        )
+        typer.echo(json.dumps({"stage": "prompt", "count": len(variants)}))
+
+        # Simple winner-take-most seed allocation:
+        V = max(1, len(variants))
+        per_round = min(seeds_per_round * V, remaining)
+        # allocate seeds: first variant gets 50%, second 30%, rest share 20%
+        plan: List[Tuple[str, int]] = []
+        if V == 1:
+            plan.append((variants[0], per_round))
+        else:
+            fifty = max(1, int(0.5 * per_round))
+            thirty = max(0, int(0.3 * per_round))
+            rest = max(0, per_round - fifty - thirty)
+            plan.append((variants[0], fifty))
+            if V >= 2 and thirty > 0:
+                plan.append((variants[1], thirty))
+            if rest > 0 and V > 2:
+                # spread across the remaining variants
+                q = rest // (V - 2)
+                r = rest % (V - 2)
+                for i, v in enumerate(variants[2:], start=2):
+                    plan.append((v, q + (1 if i - 2 < r else 0)))
+
+        # Render and score
+        round_candidates: List[Tuple[pathlib.Path, Dict[str, float], str]] = []  # (image_path, metrics, prompt)
+        for v_prompt, n_seeds in plan:
+            for s in range(n_seeds):
+                wf = _build_txt2img_workflow(cfg, v_prompt, negative, seed=random.randint(1, 2**31 - 1))
+                resp = client.queue_prompt(wf)
+                hist = client.await_prompt(resp["prompt_id"], poll_interval_s=cfg["io"]["poll_interval_s"],
+                                           timeout_s=cfg["io"]["history_timeout_s"])
+                saved = client.download_all_outputs(hist, repo_outputs_dir, disk_fallback=comfy_out_dir)
+                for p in saved:
+                    try:
+                        mp = pathlib.Path(p).resolve()
+                        # score on the fly to emit telemetry
+                        ref_img = Image.open(ref).convert("RGB")
+                        cand_img = Image.open(mp).convert("RGB")
+                        m = scorer.score_pair(ref_img, cand_img)
+                        round_candidates.append((mp, m, v_prompt))
+                        typer.echo(json.dumps({"stage": "scored", "candidate": str(mp), **m}))
+                    except Exception:
+                        continue
+                remaining -= 1
+                if remaining <= 0:
+                    break
+            if remaining <= 0:
+                break
+
+        # Select this round’s best by combined
+        if round_candidates:
+            rc_sorted = sorted(round_candidates, key=lambda t: t[1].get("combined", 0.0), reverse=True)
+            best_path, best_metrics, best_prompt = rc_sorted[0]
+            # log best-of-round
+            typer.echo(json.dumps({"stage": "best", "path": str(best_path), "metrics": best_metrics}))
+
+            # Carry forward
+            best_overall = {"path": best_path, "prompt": best_prompt, "metrics": best_metrics}
+
+        round_i += 1
+
+    # Final result
+    out = {"stage": "done"}
+    if best_overall:
+        out["best"] = str(best_overall["path"])
+        out["metrics"] = {"lpips": best_overall["metrics"].get("lpips")}
+    typer.echo(json.dumps(out))

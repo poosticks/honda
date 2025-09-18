@@ -1,0 +1,70 @@
+paths:
+  reference_dir: reference
+  outputs_dir: outputs
+  runs_dir: runs
+  workflow: workflows/txt2img_sd1.5.json
+  comfy_output_dir: C:/ComfyUI/ComfyUI/output   # adjust per machine
+
+comfy:
+  host: 127.0.0.1
+  port: 8188
+  ckpt_name: cyberrealistic_v90.safetensors
+  sampler: euler_ancestral
+  scheduler: normal
+  sd_steps: 30
+  cfg_scale: 5.0
+  width: 512
+  height: 512
+  batch_size: 1
+  filename_prefix: honda_
+
+caption:
+  backend: qwen_openai
+  openai:
+    api_base: http://127.0.0.1:1234/v1
+    model: qwen2.5-vl-3b-instruct
+    request_timeout_s: 60
+    temperature: 0.2
+    top_p: 0.9
+    max_tokens: 128
+
+prompter:
+  backend: openai_compat
+  max_variants: 7
+  inject_negative: true
+  default_negative: "low quality, blurry, oversaturated, deformed, distorted"
+  carry_forward_modifiers: 1
+  openai:
+    api_base: http://127.0.0.1:1234/v1
+    model: qwen2.5-vl-3b-instruct
+    request_timeout_s: 60
+    temperature: 0.2
+    top_p: 0.9
+    max_tokens: 256
+
+convergence:
+  iterations: 3
+  seeds_per_round: 5
+  total_budget: 21
+  device: cpu
+
+scoring:
+  device: cpu
+  use_lpips: true
+  use_clip: true
+  use_dino: false
+  use_dreamsim: false
+  clip_model: ViT-B/32
+  resize: 256
+  combine:
+    method: weighted
+    w_clip: 0.6
+
+io:
+  history_timeout_s: 90
+  poll_interval_s: 0.35
+  copy_outputs_to_repo: true
+  overwrite_existing: false
+
+debug:
+  verbose: false
